@@ -470,6 +470,16 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+@app.get("/debug/storage")
+async def debug_storage():
+    """只读诊断：确认线上是否启用 R2。绝不返回任何密钥。"""
+    return {
+        "r2_enabled": _R2_ENABLED,
+        "endpoint": R2_ENDPOINT,
+        "bucket": R2_BUCKET,
+        "backend": "r2" if _R2_ENABLED else "memory",
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
