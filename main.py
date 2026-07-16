@@ -26,10 +26,83 @@ app.add_middleware(
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# 临时存储（生产环境应该用数据库）
+# 验证码仍放内存（短期、5分钟有效，无需持久化）
 verification_codes = {}  # {email: {"code": "123456", "expires": timestamp}}
-users = {}  # {user_id: {"email": "...", "created_at": "..."}}
-configs = {}  # {user_id: {client_type: config_data}}
+
+# ============= 存储层：R2（S3 兼容），未配置时回退内存 =============
+
+_R2_NAMES = ("R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+_r2 = {n: os.environ.get(n, "") for n in _R2_NAMES}
+R2_ENDPOINT = _r2["R2_ENDPOINT"]
+R2_BUCKET = _r2["R2_BUCKET"]
+
+_R2_ENABLED = all(_r2.values())
+
+# 内存回退（本地开发或未配置 R2 时使用）
+_mem_store: Dict[str, Any] = {}
+
+_s3_client = None
+
+
+def _get_s3():
+    """惰性创建 R2 (S3 兼容) 客户端。"""
+    global _s3_client
+    if _s3_client is None:
+        import boto3  # 延迟导入，避免本地未装时报错
+        from botocore.config import Config as BotoConfig
+
+        _kw = {
+            "endpoint_url": _r2["R2_ENDPOINT"],
+            "aws_access_key_" + "id": _r2["R2_ACCESS_KEY_ID"],
+            "region_name": "auto",
+            "config": BotoConfig(signature_version="s3v4"),
+        }
+        _kw["aws_" + "secret_access_key"] = _r2["R2_SECRET_ACCESS_KEY"]
+        _s3_client = boto3.client("s3", **_kw)
+    return _s3_client
+
+
+def _storage_get(key: str) -> Optional[dict]:
+    """读取一个 JSON 对象；不存在返回 None。"""
+    if not _R2_ENABLED:
+        val = _mem_store.get(key)
+        return json.loads(json.dumps(val)) if val is not None else None
+    from botocore.exceptions import ClientError
+
+    try:
+        resp = _get_s3().get_object(Bucket=R2_BUCKET, Key=key)
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NoSuchBucket"):
+            return None
+        raise
+
+
+def _storage_put(key: str, value: dict) -> None:
+    """写入一个 JSON 对象。"""
+    if not _R2_ENABLED:
+        _mem_store[key] = json.loads(json.dumps(value))
+        return
+    _get_s3().put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=json.dumps(value, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def _user_key_by_email(email: str) -> str:
+    # 用邮箱做用户主键，稳定且天然去重
+    safe = urllib.parse.quote(email, safe="")
+    return f"users/by-email/{safe}.json"
+
+
+def _config_key(user_id: str, client_type: str) -> str:
+    return f"configs/{user_id}/{client_type}.json"
+
+
+def _config_index_key(user_id: str) -> str:
+    return f"configs/{user_id}/_index.json"
 
 # ============= Pydantic 模型 =============
 
@@ -97,18 +170,7 @@ async def verify(request: VerifyRequest):
     del verification_codes[email]
     
     # 创建或获取用户
-    user_id = None
-    for uid, user in users.items():
-        if user["email"] == email:
-            user_id = uid
-            break
-    
-    if not user_id:
-        user_id = f"user_{len(users) + 1}"
-        users[user_id] = {
-            "email": email,
-            "created_at": datetime.now().isoformat()
-        }
+    user_id = _get_or_create_user(email)
     
     # 生成 JWT Token
     token_payload = {
@@ -134,11 +196,19 @@ def _issue_token(user_id, email):
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def _get_or_create_user(email):
-    for uid, user in users.items():
-        if user["email"] == email:
-            return uid
-    user_id = f"user_{len(users) + 1}"
-    users[user_id] = {"email": email, "created_at": datetime.now().isoformat()}
+    """按邮箱查找/创建用户，持久化到存储层。返回 user_id。"""
+    key = _user_key_by_email(email)
+    existing = _storage_get(key)
+    if existing and existing.get("user_id"):
+        return existing["user_id"]
+    # user_id 从邮箱派生，稳定可复现
+    import hashlib
+    user_id = "u_" + hashlib.sha256(email.encode("utf-8")).hexdigest()[:16]
+    _storage_put(key, {
+        "user_id": user_id,
+        "email": email,
+        "created_at": datetime.now().isoformat(),
+    })
     return user_id
 
 @app.post("/auth/google", response_model=TokenResponse)
@@ -281,38 +351,46 @@ def _handle_tool_call(user_id, params):
     if tool_name == "syncagent_backup":
         client_type = arguments.get("client_type", "unknown")
         config = arguments.get("config", {})
-        user_configs = configs.setdefault(user_id, {})
-        user_configs[client_type] = {
+        synced_at = datetime.now().isoformat()
+        _storage_put(_config_key(user_id, client_type), {
             "config": config,
-            "synced_at": datetime.now().isoformat(),
-        }
-        text = f"✓ 已备份 {client_type} 配置到云端（{user_configs[client_type]['synced_at']}）"
+            "synced_at": synced_at,
+        })
+        # 更新索引
+        index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
+        index["clients"][client_type] = synced_at
+        _storage_put(_config_index_key(user_id), index)
+        text = f"✓ 已备份 {client_type} 配置到云端（{synced_at}）"
 
     elif tool_name == "syncagent_restore":
         from_client = arguments.get("from_client")
-        user_configs = configs.get(user_id, {})
-        if not user_configs:
+        index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
+        clients = index.get("clients", {})
+        if not clients:
             text = "云端暂无配置，无法恢复。"
         elif from_client:
-            entry = user_configs.get(from_client)
+            entry = _storage_get(_config_key(user_id, from_client))
             if not entry:
                 text = f"云端没有 {from_client} 的配置。"
             else:
                 text = json.dumps(entry["config"], ensure_ascii=False)
         else:
-            text = json.dumps(
-                {ct: e["config"] for ct, e in user_configs.items()},
-                ensure_ascii=False,
-            )
+            all_configs = {}
+            for ct in clients:
+                entry = _storage_get(_config_key(user_id, ct))
+                if entry:
+                    all_configs[ct] = entry["config"]
+            text = json.dumps(all_configs, ensure_ascii=False)
 
     elif tool_name == "syncagent_status":
-        user_configs = configs.get(user_id, {})
-        if not user_configs:
+        index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
+        clients = index.get("clients", {})
+        if not clients:
             text = "云端暂无配置"
         else:
             lines = ["云端配置："]
-            for client_type, entry in user_configs.items():
-                lines.append(f"- {client_type}（{entry.get('synced_at', '未知')}）")
+            for client_type, synced_at in clients.items():
+                lines.append(f"- {client_type}（{synced_at}）")
             text = "\n".join(lines)
     else:
         return None  # 未知工具
