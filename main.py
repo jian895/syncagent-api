@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any
@@ -205,138 +206,177 @@ def detect_client_from_mcp_init(client_info: Dict[str, Any]) -> str:
     
     return "unknown"
 
-# ============= MCP Server =============
+
+# ============= MCP 工具定义 =============
+
+MCP_TOOLS = [
+    {
+        "name": "syncagent_backup",
+        "description": "备份当前智能体配置到云端",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_type": {
+                    "type": "string",
+                    "description": "智能体类型，如 reasonix / cursor / claude_desktop",
+                },
+                "config": {
+                    "type": "object",
+                    "description": "要备份的配置内容（MCP 配置、技能、记忆等）",
+                },
+            },
+            "required": ["client_type", "config"],
+        },
+    },
+    {
+        "name": "syncagent_restore",
+        "description": "从云端恢复配置",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_client": {
+                    "type": "string",
+                    "description": "从哪个客户端恢复（可选，默认返回全部）",
+                }
+            },
+        },
+    },
+    {
+        "name": "syncagent_status",
+        "description": "查看云端配置状态",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+
+def _extract_bearer_user(authorization: Optional[str]) -> Optional[str]:
+    """从 Authorization 头解析 user_id，失败返回 None（不抛异常）。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[len("Bearer "):]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload.get("user_id")
+    except jwt.PyJWTError:
+        return None
+
+
+def _jsonrpc_result(msg_id, result):
+    return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
+
+def _jsonrpc_error(msg_id, code, message):
+    return JSONResponse(
+        {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+    )
+
+
+def _handle_tool_call(user_id, params):
+    """执行工具调用，返回 result dict。"""
+    tool_name = params.get("name")
+    arguments = params.get("arguments", {}) or {}
+
+    if tool_name == "syncagent_backup":
+        client_type = arguments.get("client_type", "unknown")
+        config = arguments.get("config", {})
+        user_configs = configs.setdefault(user_id, {})
+        user_configs[client_type] = {
+            "config": config,
+            "synced_at": datetime.now().isoformat(),
+        }
+        text = f"✓ 已备份 {client_type} 配置到云端（{user_configs[client_type]['synced_at']}）"
+
+    elif tool_name == "syncagent_restore":
+        from_client = arguments.get("from_client")
+        user_configs = configs.get(user_id, {})
+        if not user_configs:
+            text = "云端暂无配置，无法恢复。"
+        elif from_client:
+            entry = user_configs.get(from_client)
+            if not entry:
+                text = f"云端没有 {from_client} 的配置。"
+            else:
+                text = json.dumps(entry["config"], ensure_ascii=False)
+        else:
+            text = json.dumps(
+                {ct: e["config"] for ct, e in user_configs.items()},
+                ensure_ascii=False,
+            )
+
+    elif tool_name == "syncagent_status":
+        user_configs = configs.get(user_id, {})
+        if not user_configs:
+            text = "云端暂无配置"
+        else:
+            lines = ["云端配置："]
+            for client_type, entry in user_configs.items():
+                lines.append(f"- {client_type}（{entry.get('synced_at', '未知')}）")
+            text = "\n".join(lines)
+    else:
+        return None  # 未知工具
+
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
+# ============= MCP Server (Streamable HTTP) =============
+
+
+@app.get("/mcp")
+async def mcp_get():
+    # 本服务器为同步请求/响应模式，不提供 SSE 流
+    return Response(status_code=405)
+
 
 @app.post("/mcp")
-async def mcp_endpoint(
-    request: Request,
-    authorization: str = Header(None)
-):
-    """MCP 协议端点"""
-    user_id = verify_token(authorization)
-    body = await request.json()
-    
+async def mcp_endpoint(request: Request, authorization: Optional[str] = Header(None)):
+    """MCP Streamable HTTP 端点（application/json 请求/响应模式）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return _jsonrpc_error(None, -32700, "Parse error")
+
+    # 通知或响应消息（没有 id）→ 202 Accepted，无 body
+    if not isinstance(body, dict) or "id" not in body:
+        return Response(status_code=202)
+
+    msg_id = body.get("id")
     method = body.get("method")
-    
-    # 处理 initialize 消息
+    params = body.get("params", {}) or {}
+
+    # initialize 不需要鉴权（握手阶段）
     if method == "initialize":
-        client_info = body.get("params", {}).get("clientInfo", {})
-        current_client = detect_client_from_mcp_init(client_info)
-        
-        # 查询云端配置
-        user_configs = configs.get(user_id, {})
-        
-        # 生成提示信息
-        if not user_configs:
-            prompt = f"欢迎使用 SyncAgent！检测到你在使用 {current_client}。要备份当前配置吗？"
-        elif current_client in user_configs:
-            last_sync = user_configs[current_client].get("synced_at", "未知时间")
-            prompt = f"检测到云端有你的 {current_client} 配置（{last_sync}）。要恢复吗？"
-        else:
-            options = "\n".join([f"  - {ct}" for ct in user_configs.keys()])
-            prompt = f"检测到你在使用 {current_client}\n\n云端有以下配置：\n{options}\n\n要从哪个迁移？"
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {
-                    "name": "syncagent",
-                    "version": "1.0.0"
-                },
-                "capabilities": {
-                    "tools": {}
-                },
-                "_prompt": prompt
-            }
-        }
-    
-    # 处理 tools/list 请求
+        client_ver = params.get("protocolVersion", "2025-06-18")
+        negotiated = client_ver if client_ver in SUPPORTED_PROTOCOL_VERSIONS else "2025-06-18"
+        return _jsonrpc_result(
+            msg_id,
+            {
+                "protocolVersion": negotiated,
+                "serverInfo": {"name": "syncagent", "version": "1.0.0"},
+                "capabilities": {"tools": {"listChanged": False}},
+            },
+        )
+
+    if method == "ping":
+        return _jsonrpc_result(msg_id, {})
+
+    # 其余方法需要有效 Token
+    user_id = _extract_bearer_user(authorization)
+    if not user_id:
+        return _jsonrpc_error(msg_id, -32001, "未认证：缺少或无效的 Token")
+
     if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "result": {
-                "tools": [
-                    {
-                        "name": "syncagent_backup",
-                        "description": "备份当前配置到云端",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }
-                    },
-                    {
-                        "name": "syncagent_restore",
-                        "description": "从云端恢复配置",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "from_client": {
-                                    "type": "string",
-                                    "description": "从哪个客户端恢复（可选）"
-                                }
-                            }
-                        }
-                    },
-                    {
-                        "name": "syncagent_status",
-                        "description": "查看云端配置状态",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {}
-                        }
-                    }
-                ]
-            }
-        }
-    
-    # 处理 tools/call 请求
+        return _jsonrpc_result(msg_id, {"tools": MCP_TOOLS})
+
     if method == "tools/call":
-        tool_name = body.get("params", {}).get("name")
-        arguments = body.get("params", {}).get("arguments", {})
-        
-        # 简化版实现（生产环境需要实际读写配置文件）
-        if tool_name == "syncagent_status":
-            user_configs = configs.get(user_id, {})
-            if not user_configs:
-                content = "云端暂无配置"
-            else:
-                content = "云端配置：\n"
-                for client_type, config_data in user_configs.items():
-                    synced_at = config_data.get("synced_at", "未知")
-                    content += f"- {client_type}（{synced_at}）\n"
-            
-            return {
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": content
-                        }
-                    ]
-                }
-            }
-        
-        # 其他工具待实现
-        return {
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"工具 {tool_name} 正在开发中..."
-                    }
-                ]
-            }
-        }
-    
-    raise HTTPException(status_code=400, detail="不支持的 MCP 方法")
+        result = _handle_tool_call(user_id, params)
+        if result is None:
+            return _jsonrpc_error(msg_id, -32602, f"未知工具：{params.get('name')}")
+        return _jsonrpc_result(msg_id, result)
+
+    return _jsonrpc_error(msg_id, -32601, f"Method not found: {method}")
+
 
 # ============= 健康检查 =============
 
