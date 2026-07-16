@@ -435,6 +435,11 @@ def _jsonrpc_error(msg_id, code, message):
     )
 
 
+# AI 有时会在 config 里塞非文件的辅助键（如 metadata / checked_paths），
+# 这些不是要恢复的文件，backup 时剥离、restore 时跳过。
+RESERVED_CONFIG_KEYS = {"metadata", "checked_paths", "excluded", "secret_policy", "workspace", "_meta", "notes"}
+
+
 def _iter_files(kind, value):
     """把一个 kind 的存储值规整成 [{relpath, content}] 列表。
     新格式：值本身就是 [{relpath, content}, ...]。
@@ -481,8 +486,11 @@ def _build_restore_plan(client_type: str, config: dict) -> str:
         for f in kfiles:
             files.append({"kind": kind, "relpath": f["relpath"], "content": f["content"]})
 
-    # config 里有、但 manifest 未列的 kind 也一并恢复（向后兼容旧备份）
+    # config 里有、但 manifest 未列的 kind 也一并恢复（向后兼容旧备份）。
+    # 跳过 AI 有时自作主张塞进来的元数据键（非文件内容，不该被当成待写文件）。
     for kind, value in config.items():
+        if kind in RESERVED_CONFIG_KEYS:
+            continue
         if any(it.get("kind") == kind for it in manifest["items"]):
             continue
         for f in _iter_files(kind, value):
@@ -531,6 +539,9 @@ def _handle_tool_call(user_id, params):
                 + "\n注意：密钥类文件（API key / token）无需备份，恢复后本机重配即可。"
             )
             return {"content": [{"type": "text", "text": hint}], "isError": True}
+
+        # 剥离 AI 有时自作主张塞进来的元数据键（非文件内容），不入库。
+        config = {k: v for k, v in config.items() if k not in RESERVED_CONFIG_KEYS}
 
         synced_at = datetime.now().isoformat()
         _storage_put(_config_key(user_id, client_type), {
