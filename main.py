@@ -91,6 +91,14 @@ def _storage_put(key: str, value: dict) -> None:
     )
 
 
+def _storage_delete(key: str) -> None:
+    """删除一个对象；不存在也不报错。"""
+    if not _R2_ENABLED:
+        _mem_store.pop(key, None)
+        return
+    _get_s3().delete_object(Bucket=R2_BUCKET, Key=key)
+
+
 def _user_key_by_email(email: str) -> str:
     # 用邮箱做用户主键，稳定且天然去重
     safe = urllib.parse.quote(email, safe="")
@@ -285,10 +293,21 @@ BACKUP_MANIFESTS = {
     "reasonix": {
         "display_name": "Reasonix",
         "items": [
-            {"kind": "mcp", "path": "~/.reasonix/config.toml", "desc": "MCP 服务器配置（config.toml 里的 [mcp_servers]）"},
+            {"kind": "mcp", "path": "~/.reasonix/config.toml", "desc": "MCP 服务器配置（config.toml 里的 [mcp_servers]）。只备份结构；其中的 API key / token 属于本机密钥，恢复后请在新机器本地重新配置，不要写进备份。"},
             {"kind": "skills", "path": "~/.reasonix/skills/", "desc": "自定义技能，收集每个子目录下的 SKILL.md（含 frontmatter）"},
             {"kind": "memory", "path": "~/.reasonix/memory/", "desc": "记忆文件，收集所有 *.md"},
+            {"kind": "soul", "path": "~/.reasonix/SOUL.md", "desc": "人格设定 SOUL.md（若存在）"},
             {"kind": "agents_md", "path": "AGENTS.md", "desc": "项目根目录的 AGENTS.md 项目记忆（若存在）"},
+        ],
+    },
+    "hermes": {
+        "display_name": "Hermes",
+        "items": [
+            {"kind": "mcp", "path": "~/.hermes/cli-config.yaml", "desc": "MCP / 客户端配置（$HERMES_HOME 默认 ~/.hermes）。只备份结构；.env 里的 API key / token 属于本机密钥，恢复后请在新机器本地重新配置，不要写进备份。"},
+            {"kind": "skills", "path": "~/.hermes/skills/", "desc": "技能（procedural memory），收集每个子目录下的 SKILL.md；含 openclaw-imports/ 下导入的技能"},
+            {"kind": "memory", "path": "~/.hermes/", "desc": "记忆文件，收集 MEMORY.md 与 USER.md（若存在）"},
+            {"kind": "soul", "path": "~/.hermes/SOUL.md", "desc": "人格设定 SOUL.md（若存在）"},
+            {"kind": "agents_md", "path": "AGENTS.md", "desc": "工作区指令 AGENTS.md（若存在）"},
         ],
     },
     "cursor": {
@@ -348,8 +367,11 @@ MCP_TOOLS = [
     {
         "name": "syncagent_backup",
         "description": (
-            "备份智能体配置到云端。调用前应先用 syncagent_get_backup_manifest 拿到清单，"
-            "按清单读取本地文件，把内容放进 config。config 是一个对象，键为清单里的条目名（如 mcp_config / skills / memory / project_rules），值为对应文件的实际内容。"
+            "备份智能体配置到云端。调用前必须先用 syncagent_get_backup_manifest 拿到清单，"
+            "并读取清单里【每一个】条目对应的本地文件，把内容放进 config。config 是一个对象，键为清单里每个条目的 kind（如 mcp / skills / memory / soul / agents_md），值为对应文件的实际内容。"
+            "必须覆盖清单的全部 kind：某项在本机不存在时，把该 key 显式设为 null（表示已检查、不存在），不要省略该 key。"
+            "若缺少清单里的某些 kind，本次备份会被拒绝并要求你补齐后重试。"
+            "mcp / 配置类内容中的 API key、token 等密钥请替换为占位符或删除，不要上传真实密钥。"
         ),
         "inputSchema": {
             "type": "object",
@@ -419,6 +441,28 @@ def _handle_tool_call(user_id, params):
     if tool_name == "syncagent_backup":
         client_type = arguments.get("client_type", "unknown")
         config = arguments.get("config", {})
+
+        # 缺项校验：manifest 里的每个 kind 都必须在 config 出现（有内容，或显式标记本机不存在）。
+        # 只要某个 kind 压根没出现（说明 AI 根本没去读它），就打回，逼它补齐。
+        if not isinstance(config, dict):
+            config = {}
+        manifest = _get_manifest(client_type)
+        expected = [it["kind"] for it in manifest["items"] if it.get("kind")]
+        missing = [k for k in expected if k not in config]
+        if missing:
+            missing_lines = []
+            for it in manifest["items"]:
+                if it.get("kind") in missing:
+                    missing_lines.append(f"  - {it['kind']}：{it.get('path','')} — {it.get('desc','')}")
+            hint = (
+                f"备份未完成：{client_type} 的配置清单要求收齐以下条目，但 config 里缺少 "
+                f"{missing}。\n请读取下列每一项的本地内容后重新调用 syncagent_backup（key 用条目的 kind）；"
+                f"若某项在本机确实不存在，也要把该 key 显式设为 null 表示“已检查、不存在”，不要直接省略：\n"
+                + "\n".join(missing_lines)
+                + "\n注意：密钥类文件（API key / token）无需备份，恢复后本机重配即可。"
+            )
+            return {"content": [{"type": "text", "text": hint}], "isError": True}
+
         synced_at = datetime.now().isoformat()
         _storage_put(_config_key(user_id, client_type), {
             "config": config,
@@ -428,7 +472,13 @@ def _handle_tool_call(user_id, params):
         index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
         index["clients"][client_type] = synced_at
         _storage_put(_config_index_key(user_id), index)
-        text = f"✓ 已备份 {client_type} 配置到云端（{synced_at}）"
+        # 报告实际备份了哪些项（区分有内容 / 本机不存在）
+        present = [k for k in expected if config.get(k) not in (None, "", {}, [])]
+        absent = [k for k in expected if k in config and config.get(k) in (None, "", {}, [])]
+        line = f"✓ 已备份 {client_type} 配置到云端（{synced_at}）\n  已收录：{present or '无'}"
+        if absent:
+            line += f"\n  本机不存在（已记录为空）：{absent}"
+        text = line
 
     elif tool_name == "syncagent_restore":
         from_client = arguments.get("from_client")
@@ -472,6 +522,9 @@ def _handle_tool_call(user_id, params):
                 "请读取上面 items 里列出的每个本地文件/目录的实际内容，"
                 "组装成一个 config 对象（键用条目的 kind，值为文件内容），"
                 "然后调用 syncagent_backup 完成备份。"
+                "【必须收齐所有条目，禁止只备份一部分，禁止反过来询问用户是否要备份 skills/memory/soul——它们都是必备项。】"
+                "若某个条目在本机确实不存在（如没有 SOUL.md），也要把对应 key 显式设为 null，表示“已检查、不存在”，不要直接省略该 key，否则备份会被判定为未完成并打回。"
+                "【密钥例外】mcp / 配置类文件里的 API key、token 等密钥无需备份：请只保留配置结构，把密钥值替换为占位符或删除；恢复后由用户在新机器本地重新配置。"
             ),
         }
         text = json.dumps(payload, ensure_ascii=False)
@@ -596,6 +649,29 @@ async def get_backup_detail(client_type: str, authorization: Optional[str] = Hea
         "synced_at": entry.get("synced_at"),
         "config": entry.get("config", {}),
     }
+
+
+@app.delete("/api/backups/{client_type}")
+async def delete_backup(client_type: str, authorization: Optional[str] = Header(None)):
+    """删除某客户端的备份：移除配置对象，并从索引中摘除该 client。"""
+    user_id = verify_token(authorization)
+
+    index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
+    clients = index.get("clients", {})
+    entry = _storage_get(_config_key(user_id, client_type))
+
+    if not entry and client_type not in clients:
+        raise HTTPException(status_code=404, detail="该客户端暂无备份")
+
+    # 删除配置对象
+    _storage_delete(_config_key(user_id, client_type))
+    # 从索引摘除
+    if client_type in clients:
+        del clients[client_type]
+        index["clients"] = clients
+        _storage_put(_config_index_key(user_id), index)
+
+    return {"deleted": client_type, "remaining": list(clients.keys())}
 
 
 @app.get("/debug/storage")
