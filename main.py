@@ -7,6 +7,8 @@ import os
 from datetime import datetime, timedelta
 import random
 import json
+import urllib.request
+import urllib.parse
 
 app = FastAPI(title="SyncAgent API", version="1.0.0")
 
@@ -40,6 +42,9 @@ class VerifyRequest(BaseModel):
 class TokenResponse(BaseModel):
     token: str
     user_id: str
+
+class GoogleAuthRequest(BaseModel):
+    credential: str  # Google Identity Services 返回的 ID token (JWT)
 
 # ============= 认证相关 API =============
 
@@ -113,6 +118,55 @@ async def verify(request: VerifyRequest):
     }
     token = jwt.encode(token_payload, JWT_SECRET, algorithm="HS256")
     
+    return TokenResponse(token=token, user_id=user_id)
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+
+def _issue_token(user_id, email):
+    """签发 SyncAgent 自己的 JWT"""
+    payload = {
+        "user_id": user_id,
+        "email": email,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(days=365),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def _get_or_create_user(email):
+    for uid, user in users.items():
+        if user["email"] == email:
+            return uid
+    user_id = f"user_{len(users) + 1}"
+    users[user_id] = {"email": email, "created_at": datetime.now().isoformat()}
+    return user_id
+
+@app.post("/auth/google", response_model=TokenResponse)
+async def auth_google(request: GoogleAuthRequest):
+    """用 Google 登录：验证 Google ID token，签发 SyncAgent Token"""
+    credential = request.credential
+
+    # 通过 Google tokeninfo 端点验证 ID token（无需额外依赖）
+    try:
+        url = "https://oauth2.googleapis.com/tokeninfo?" + urllib.parse.urlencode({"id_token": credential})
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+    except Exception:
+        raise HTTPException(status_code=401, detail="无法验证 Google 登录凭证")
+
+    # 校验 audience（如果配置了 GOOGLE_CLIENT_ID）
+    if GOOGLE_CLIENT_ID and info.get("aud") != GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=401, detail="Google 凭证的 client id 不匹配")
+
+    # 校验签发方
+    if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(status_code=401, detail="Google 凭证签发方无效")
+
+    email = info.get("email")
+    if not email or info.get("email_verified") not in ("true", True):
+        raise HTTPException(status_code=401, detail="Google 账号邮箱未验证")
+
+    user_id = _get_or_create_user(email)
+    token = _issue_token(user_id, email)
     return TokenResponse(token=token, user_id=user_id)
 
 # ============= 辅助函数 =============
