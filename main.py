@@ -553,6 +553,51 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+# ============= "我的备份" 只读 API（JWT 鉴权）=============
+
+@app.get("/api/backups")
+async def list_backups(authorization: Optional[str] = Header(None)):
+    """列出当前用户所有客户端的备份摘要。"""
+    user_id = verify_token(authorization)
+    index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
+    clients = index.get("clients", {})
+
+    backups = []
+    for client_type, synced_at in clients.items():
+        manifest = _get_manifest(client_type)
+        entry = _storage_get(_config_key(user_id, client_type))
+        config = (entry or {}).get("config", {}) or {}
+        item_keys = list(config.keys()) if isinstance(config, dict) else []
+        backups.append({
+            "client_type": client_type,
+            "display_name": manifest["display_name"],
+            "synced_at": synced_at,
+            "item_count": len(item_keys),
+            "items": item_keys,
+        })
+
+    # 最近备份排前面
+    backups.sort(key=lambda b: b.get("synced_at") or "", reverse=True)
+    return {"backups": backups}
+
+
+@app.get("/api/backups/{client_type}")
+async def get_backup_detail(client_type: str, authorization: Optional[str] = Header(None)):
+    """查看某客户端备份的详细内容。"""
+    user_id = verify_token(authorization)
+    entry = _storage_get(_config_key(user_id, client_type))
+    if not entry:
+        raise HTTPException(status_code=404, detail="该客户端暂无备份")
+
+    manifest = _get_manifest(client_type)
+    return {
+        "client_type": client_type,
+        "display_name": manifest["display_name"],
+        "synced_at": entry.get("synced_at"),
+        "config": entry.get("config", {}),
+    }
+
+
 @app.get("/debug/storage")
 async def debug_storage():
     """只读诊断：确认线上是否启用 R2。绝不返回任何密钥。"""
