@@ -293,11 +293,11 @@ BACKUP_MANIFESTS = {
     "reasonix": {
         "display_name": "Reasonix",
         "items": [
-            {"kind": "mcp", "path": "~/.reasonix/config.toml", "desc": "MCP 服务器配置（config.toml 里的 [mcp_servers]）。只备份结构；其中的 API key / token 属于本机密钥，恢复后请在新机器本地重新配置，不要写进备份。"},
-            {"kind": "skills", "path": "~/.reasonix/skills/", "desc": "自定义技能，收集每个子目录下的 SKILL.md（含 frontmatter）"},
-            {"kind": "memory", "path": "~/.reasonix/memory/", "desc": "记忆文件，收集所有 *.md"},
-            {"kind": "soul", "path": "~/.reasonix/SOUL.md", "desc": "人格设定 SOUL.md（若存在）"},
-            {"kind": "agents_md", "path": "AGENTS.md", "desc": "项目根目录的 AGENTS.md 项目记忆（若存在）"},
+            {"kind": "mcp", "path": "~/.reasonix/config.toml", "desc": "全局 MCP / provider 配置（~/.reasonix/config.toml）。只备份结构；其中 api_key_env 引用的密钥真值在 <Reasonix home>/.env，属于本机密钥，恢复后本地重配，不要写进备份。收 1 个文件，relpath 用 'config.toml'。"},
+            {"kind": "mcp_project", "path": "./reasonix.toml", "desc": "当前工作区的 MCP 插件配置（工作区根目录 reasonix.toml，[[plugins]] 段，若存在）。只备份结构，密钥同样不上传。relpath 用 'reasonix.toml'。"},
+            {"kind": "skills", "path": "~/.reasonix/skills/", "desc": "全局技能，收集每个子目录下的 SKILL.md（含 frontmatter）。每个文件 relpath 用相对 ~/.reasonix/ 的路径，如 'skills/<名字>/SKILL.md'。"},
+            {"kind": "memory", "path": "~/.reasonix/projects/<当前工作区编码>/memory/", "desc": "记忆文件，按工作区隔离。定位当前工作区对应的 projects/<编码>/memory/ 目录，收集其中所有 *.md。每个文件 relpath 用 'memory/<文件名>.md'。若当前工作区无记忆则记 null。"},
+            {"kind": "agents_md", "path": "./AGENTS.md", "desc": "当前工作区根目录的 AGENTS.md 项目记忆（若存在）。relpath 用 'AGENTS.md'。"},
         ],
     },
     "hermes": {
@@ -368,10 +368,12 @@ MCP_TOOLS = [
         "name": "syncagent_backup",
         "description": (
             "备份智能体配置到云端。调用前必须先用 syncagent_get_backup_manifest 拿到清单，"
-            "并读取清单里【每一个】条目对应的本地文件，把内容放进 config。config 是一个对象，键为清单里每个条目的 kind（如 mcp / skills / memory / soul / agents_md），值为对应文件的实际内容。"
-            "必须覆盖清单的全部 kind：某项在本机不存在时，把该 key 显式设为 null（表示已检查、不存在），不要省略该 key。"
+            "并读取清单里【每一个】条目对应的本地文件。config 是一个对象，键为清单里每个条目的 kind（如 mcp / skills / memory / soul / agents_md）。"
+            "每个 kind 的值必须是一个文件数组：[{\"relpath\": \"相对配置根目录的路径\", \"content\": \"文件全文\"}, ...]。"
+            "一个目录类条目（如 skills、memory）通常包含多个文件，就放多个元素；单文件条目放一个元素。relpath 必须是真实的相对路径（如 skills/git-helper/SKILL.md），恢复时会据此原样写回。"
+            "必须覆盖清单的全部 kind：某项在本机不存在时，把该 key 显式设为 null（表示已检查、不存在），不要省略该 key，也不要传空数组冒充。"
             "若缺少清单里的某些 kind，本次备份会被拒绝并要求你补齐后重试。"
-            "mcp / 配置类内容中的 API key、token 等密钥请替换为占位符或删除，不要上传真实密钥。"
+            "mcp / 配置类文件的 content 中，API key、token 等密钥请替换为占位符或删除，不要上传真实密钥。"
         ),
         "inputSchema": {
             "type": "object",
@@ -433,6 +435,73 @@ def _jsonrpc_error(msg_id, code, message):
     )
 
 
+def _iter_files(kind, value):
+    """把一个 kind 的存储值规整成 [{relpath, content}] 列表。
+    新格式：值本身就是 [{relpath, content}, ...]。
+    旧格式兼容：值是字符串 → 包成单文件（relpath 用占位，提示 AI 按 manifest 判断路径）。
+    None / 空 → 返回 []（本机不存在，无需恢复）。
+    """
+    if value in (None, "", {}, []):
+        return []
+    if isinstance(value, list):
+        out = []
+        for f in value:
+            if isinstance(f, dict) and "content" in f:
+                out.append({"relpath": f.get("relpath") or f"{kind}", "content": f.get("content", "")})
+            elif isinstance(f, str):
+                out.append({"relpath": f"{kind}", "content": f})
+        return out
+    if isinstance(value, str):
+        return [{"relpath": f"{kind}（旧格式，路径请按 manifest 判断）", "content": value}]
+    if isinstance(value, dict):
+        # 旧格式偶发：{文件名: 内容}
+        return [{"relpath": k, "content": v} for k, v in value.items() if isinstance(v, str)]
+    return []
+
+
+def _build_restore_plan(client_type: str, config: dict) -> str:
+    """把云端存的 config 转成 AI 照单写回本地的明确指令（路径 + 内容）。"""
+    manifest = _get_manifest(client_type)
+    if not isinstance(config, dict):
+        config = {}
+
+    files = []           # [{kind, relpath, content}]
+    skipped_secret = []  # 密钥类 kind，恢复时提示本机重配
+    empty_kinds = []     # 本机不存在（备份时记 null）
+    for it in manifest["items"]:
+        kind = it.get("kind")
+        if not kind:
+            continue
+        kfiles = _iter_files(kind, config.get(kind))
+        if not kfiles:
+            empty_kinds.append(kind)
+            continue
+        if kind.startswith("mcp"):
+            skipped_secret.append(kind)
+        for f in kfiles:
+            files.append({"kind": kind, "relpath": f["relpath"], "content": f["content"]})
+
+    # config 里有、但 manifest 未列的 kind 也一并恢复（向后兼容旧备份）
+    for kind, value in config.items():
+        if any(it.get("kind") == kind for it in manifest["items"]):
+            continue
+        for f in _iter_files(kind, value):
+            files.append({"kind": kind, "relpath": f["relpath"], "content": f["content"]})
+
+    plan = {
+        "client_type": client_type,
+        "instruction": (
+            "下面是需要恢复到本地的文件清单。请把每个 file 的 content 原样写入对应 relpath（相对该客户端配置根目录）。"
+            "写入前若目录不存在请创建。已存在的文件属于覆盖恢复，请先向用户确认再覆盖。"
+            "mcp / 配置类文件中的密钥为占位符，恢复后需在本机填入真实 API key / token。"
+        ),
+        "files": files,
+        "skipped_secret_kinds": skipped_secret,
+        "absent_on_backup": empty_kinds,
+    }
+    return json.dumps(plan, ensure_ascii=False)
+
+
 def _handle_tool_call(user_id, params):
     """执行工具调用，返回 result dict。"""
     tool_name = params.get("name")
@@ -491,14 +560,18 @@ def _handle_tool_call(user_id, params):
             if not entry:
                 text = f"云端没有 {from_client} 的配置。"
             else:
-                text = json.dumps(entry["config"], ensure_ascii=False)
+                text = _build_restore_plan(from_client, entry.get("config", {}))
         else:
-            all_configs = {}
-            for ct in clients:
-                entry = _storage_get(_config_key(user_id, ct))
-                if entry:
-                    all_configs[ct] = entry["config"]
-            text = json.dumps(all_configs, ensure_ascii=False)
+            # 未指定来源：默认恢复最近备份的那个客户端，避免把多个客户端的文件混写。
+            latest = max(clients.items(), key=lambda kv: kv[1] or "")[0]
+            entry = _storage_get(_config_key(user_id, latest))
+            if not entry:
+                text = f"云端没有 {latest} 的配置。"
+            else:
+                others = [c for c in clients if c != latest]
+                text = _build_restore_plan(latest, entry.get("config", {}))
+                if others:
+                    text += f"\n\n（云端还有其它客户端备份：{others}。如需恢复其中某个，调用 syncagent_restore 时传 from_client。）"
 
     elif tool_name == "syncagent_status":
         index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
@@ -519,11 +592,11 @@ def _handle_tool_call(user_id, params):
             "display_name": manifest["display_name"],
             "items": manifest["items"],
             "instruction": (
-                "请读取上面 items 里列出的每个本地文件/目录的实际内容，"
-                "组装成一个 config 对象（键用条目的 kind，值为文件内容），"
-                "然后调用 syncagent_backup 完成备份。"
+                "请读取上面 items 里列出的每个本地文件/目录的实际内容，组装成一个 config 对象后调用 syncagent_backup。"
+                "【格式】config 的键是条目的 kind；值必须是文件清单数组：[{\"relpath\": \"相对配置根目录的路径\", \"content\": \"文件内容\"}, ...]。"
+                "目录类条目（skills / memory 等）把目录下每个文件各作为数组里的一个元素，relpath 用相对路径保留原始文件名与子目录结构（如 skills/git-helper/SKILL.md），这样恢复时才能还原到原位。单文件条目也用长度为 1 的数组。"
                 "【必须收齐所有条目，禁止只备份一部分，禁止反过来询问用户是否要备份 skills/memory/soul——它们都是必备项。】"
-                "若某个条目在本机确实不存在（如没有 SOUL.md），也要把对应 key 显式设为 null，表示“已检查、不存在”，不要直接省略该 key，否则备份会被判定为未完成并打回。"
+                "若某个条目在本机确实不存在（如没有 SOUL.md），把对应 key 显式设为 null，表示“已检查、不存在”，不要省略该 key，否则备份会被判定为未完成并打回。"
                 "【密钥例外】mcp / 配置类文件里的 API key、token 等密钥无需备份：请只保留配置结构，把密钥值替换为占位符或删除；恢复后由用户在新机器本地重新配置。"
             ),
         }
