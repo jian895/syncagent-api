@@ -277,12 +277,80 @@ def detect_client_from_mcp_init(client_info: Dict[str, Any]) -> str:
     return "unknown"
 
 
+# ============= 各客户端备份清单 =============
+
+# 每个智能体的配置结构不同，备份清单据此区分。
+# AI 调用 get_backup_manifest 拿到清单后，按 items 逐项收集内容再调用 backup。
+BACKUP_MANIFESTS = {
+    "reasonix": {
+        "display_name": "Reasonix",
+        "items": [
+            {"kind": "mcp", "path": "~/.reasonix/config.toml", "desc": "MCP 服务器配置（config.toml 里的 [mcp_servers]）"},
+            {"kind": "skills", "path": "~/.reasonix/skills/", "desc": "自定义技能，收集每个子目录下的 SKILL.md（含 frontmatter）"},
+            {"kind": "memory", "path": "~/.reasonix/memory/", "desc": "记忆文件，收集所有 *.md"},
+            {"kind": "agents_md", "path": "AGENTS.md", "desc": "项目根目录的 AGENTS.md 项目记忆（若存在）"},
+        ],
+    },
+    "cursor": {
+        "display_name": "Cursor",
+        "items": [
+            {"kind": "mcp", "path": "~/.cursor/mcp.json", "desc": "MCP 服务器配置"},
+            {"kind": "rules", "path": ".cursorrules", "desc": "项目规则文件 .cursorrules（若存在）"},
+            {"kind": "rules_dir", "path": ".cursor/rules/", "desc": "新版规则目录 .cursor/rules/*.mdc（若存在）"},
+        ],
+    },
+    "claude_desktop": {
+        "display_name": "Claude Desktop",
+        "items": [
+            {"kind": "mcp", "path": "claude_desktop_config.json", "desc": "MCP 服务器配置（mcpServers 段）"},
+        ],
+    },
+    "windsurf": {
+        "display_name": "Windsurf",
+        "items": [
+            {"kind": "mcp", "path": "~/.codeium/windsurf/mcp_config.json", "desc": "MCP 服务器配置"},
+            {"kind": "rules", "path": ".windsurfrules", "desc": "项目规则文件 .windsurfrules（若存在）"},
+        ],
+    },
+    "unknown": {
+        "display_name": "未知客户端",
+        "items": [
+            {"kind": "mcp", "path": "", "desc": "该客户端的 MCP 服务器配置（自行判断路径）"},
+        ],
+    },
+}
+
+
+def _get_manifest(client_type: str) -> dict:
+    return BACKUP_MANIFESTS.get(client_type, BACKUP_MANIFESTS["unknown"])
+
+
 # ============= MCP 工具定义 =============
 
 MCP_TOOLS = [
     {
+        "name": "syncagent_get_backup_manifest",
+        "description": (
+            "备份前必须先调用此工具。传入 client_type，返回该智能体应该备份哪些文件/目录的清单。"
+            "然后你需要读取清单中列出的每一项本地文件内容，组装成 config 参数，再调用 syncagent_backup。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_type": {
+                    "type": "string",
+                    "description": "智能体类型，如 reasonix / cursor / claude_desktop / windsurf",
+                },
+            },
+            "required": ["client_type"],
+        },
+    },
+    {
         "name": "syncagent_backup",
-        "description": "备份当前智能体配置到云端",
+        "description": (
+            "备份智能体配置到云端。调用前应先用 syncagent_get_backup_manifest 拿到清单，"
+            "按清单读取本地文件，把内容放进 config。config 是一个对象，键为清单里的条目名（如 mcp_config / skills / memory / project_rules），值为对应文件的实际内容。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -292,7 +360,7 @@ MCP_TOOLS = [
                 },
                 "config": {
                     "type": "object",
-                    "description": "要备份的配置内容（MCP 配置、技能、记忆等）",
+                    "description": "按备份清单收集到的配置内容（MCP 配置、技能、记忆等文件的实际内容）",
                 },
             },
             "required": ["client_type", "config"],
@@ -392,6 +460,21 @@ def _handle_tool_call(user_id, params):
             for client_type, synced_at in clients.items():
                 lines.append(f"- {client_type}（{synced_at}）")
             text = "\n".join(lines)
+
+    elif tool_name == "syncagent_get_backup_manifest":
+        client_type = arguments.get("client_type", "unknown")
+        manifest = _get_manifest(client_type)
+        payload = {
+            "client_type": client_type,
+            "display_name": manifest["display_name"],
+            "items": manifest["items"],
+            "instruction": (
+                "请读取上面 items 里列出的每个本地文件/目录的实际内容，"
+                "组装成一个 config 对象（键用条目的 kind，值为文件内容），"
+                "然后调用 syncagent_backup 完成备份。"
+            ),
+        }
+        text = json.dumps(payload, ensure_ascii=False)
     else:
         return None  # 未知工具
 
