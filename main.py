@@ -1026,6 +1026,187 @@ async def list_mcps(authorization: Optional[str] = Header(None)):
     }
 
 
+@app.post("/api/mcps/test")
+async def test_mcp(request: Request, authorization: Optional[str] = Header(None)):
+    """保存前探测 MCP 是否可达（服务端代发，绕开浏览器 CORS）。
+
+    当前支持 transport=http：向 url 发 MCP initialize（JSON-RPC）。
+    stdio 无法在云端执行用户本机命令，返回明确提示。
+    编辑已有条目时：若 body 未带 headers/env，可用 id 合并库里的密钥再测。
+    """
+    user_id = verify_token(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="无效 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+    transport = (body.get("transport") or "http").strip().lower()
+    url = (body.get("url") or "").strip()
+    headers = body.get("headers") if isinstance(body.get("headers"), dict) else {}
+    headers = {str(k): str(v) for k, v in headers.items()}
+
+    # 编辑场景：表单可能不带密钥，用已存条目补全
+    mcp_id = (body.get("id") or "").strip()
+    if mcp_id:
+        existing = next((s for s in _load_mcp_servers(user_id) if s.get("id") == mcp_id), None)
+        if existing:
+            if not transport:
+                transport = existing.get("transport") or "http"
+            if not url:
+                url = existing.get("url") or ""
+            if not headers:
+                headers = existing.get("headers") if isinstance(existing.get("headers"), dict) else {}
+
+    if transport == "stdio":
+        return {
+            "ok": False,
+            "skipped": True,
+            "message": "本地命令（stdio）无法在云端测试，请保存后在本机智能体里验证。",
+        }
+
+    if transport != "http":
+        raise HTTPException(status_code=400, detail="transport 只能是 http 或 stdio")
+    if not url:
+        raise HTTPException(status_code=400, detail="请填写 URL")
+    if not (url.startswith("https://") or url.startswith("http://")):
+        raise HTTPException(status_code=400, detail="URL 须以 http:// 或 https:// 开头")
+
+    # 组装 MCP initialize
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "syncagent-test", "version": "1.0.0"},
+        },
+    }
+    req_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    for k, v in headers.items():
+        if k and v is not None:
+            req_headers[str(k)] = str(v)
+
+    import urllib.error
+    import socket
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+    started = datetime.now()
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            raw = resp.read(8000)
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            raw = e.read(8000)
+        except Exception:
+            raw = b""
+        ctype = (e.headers.get("Content-Type") if e.headers else "") or ""
+        ctype = ctype.lower()
+        ms = int((datetime.now() - started).total_seconds() * 1000)
+        snippet = raw.decode("utf-8", errors="replace")[:400]
+        # 401/403 明确鉴权问题
+        if status in (401, 403):
+            return {
+                "ok": False,
+                "status": status,
+                "latency_ms": ms,
+                "message": f"鉴权失败（HTTP {status}），请检查 Token / headers。",
+                "body_preview": snippet,
+            }
+        # 部分 MCP 对错误方法也回 4xx，但仍说明网络通
+        return {
+            "ok": False,
+            "status": status,
+            "latency_ms": ms,
+            "message": f"服务器返回 HTTP {status}。",
+            "body_preview": snippet,
+        }
+    except urllib.error.URLError as e:
+        ms = int((datetime.now() - started).total_seconds() * 1000)
+        reason = getattr(e, "reason", e)
+        return {
+            "ok": False,
+            "latency_ms": ms,
+            "message": f"无法连接：{reason}",
+        }
+    except socket.timeout:
+        return {"ok": False, "message": "连接超时（10s）"}
+    except Exception as e:
+        return {"ok": False, "message": f"探测失败：{type(e).__name__}: {e}"}
+
+    ms = int((datetime.now() - started).total_seconds() * 1000)
+    text = raw.decode("utf-8", errors="replace")
+    snippet = text[:400]
+
+    # 解析 JSON 或极简 SSE data: 行
+    parsed = None
+    if "application/json" in ctype or text.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+    elif "text/event-stream" in ctype or "data:" in text:
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                chunk = line[5:].strip()
+                if chunk and chunk != "[DONE]":
+                    try:
+                        parsed = json.loads(chunk)
+                        break
+                    except Exception:
+                        continue
+
+    if isinstance(parsed, dict):
+        if "result" in parsed:
+            server = (parsed.get("result") or {}).get("serverInfo") or {}
+            sname = server.get("name") or ""
+            sver = server.get("version") or ""
+            extra = f"（{sname} {sver}）".strip() if (sname or sver) else ""
+            return {
+                "ok": True,
+                "status": status,
+                "latency_ms": ms,
+                "message": f"连接成功，MCP initialize 正常{extra}。",
+                "serverInfo": server or None,
+            }
+        if "error" in parsed:
+            err = parsed.get("error") or {}
+            return {
+                "ok": False,
+                "status": status,
+                "latency_ms": ms,
+                "message": f"MCP 返回错误：{err.get('message') or err}",
+                "body_preview": snippet,
+            }
+
+    # HTTP 2xx 但不是标准 JSON-RPC：仍算可达，弱成功
+    if 200 <= int(status) < 300:
+        return {
+            "ok": True,
+            "status": status,
+            "latency_ms": ms,
+            "message": "HTTP 可达，但未解析到标准 MCP initialize 结果（可能协议略有差异）。",
+            "body_preview": snippet,
+        }
+    return {
+        "ok": False,
+        "status": status,
+        "latency_ms": ms,
+        "message": f"意外响应 HTTP {status}",
+        "body_preview": snippet,
+    }
+
+
 @app.post("/api/mcps")
 async def create_mcp(request: Request, authorization: Optional[str] = Header(None)):
     """新增一条托管 MCP（可含 headers/env 密钥）。"""
