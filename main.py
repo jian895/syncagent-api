@@ -310,6 +310,16 @@ BACKUP_MANIFESTS = {
             {"kind": "agents_md", "path": "AGENTS.md", "desc": "工作区指令 AGENTS.md（若存在）"},
         ],
     },
+    "codex": {
+        "display_name": "Codex",
+        "items": [
+            {"kind": "mcp", "path": "~/.codex/config.toml", "desc": "MCP / provider 配置（~/.codex/config.toml）。只备份结构；其中的 API key / token 属于本机密钥，恢复后本地重配，不要写进备份。auth.json、browser/sessions、mcp-oauth-locks 是登录态，绝不备份。relpath 用 'config.toml'。"},
+            {"kind": "skills", "path": "~/.codex/skills/", "desc": "用户技能，收集每个子目录下的 SKILL.md（含 frontmatter）。【只收用户技能，排除 skills/.system/ 系统自带技能，也排除 plugins/、.tmp/ 下的技能】。每个文件 relpath 用相对 ~/.codex/ 的路径，如 'skills/<名字>/SKILL.md'。"},
+            {"kind": "rules", "path": "~/.codex/rules/", "desc": "规则 / 人格设定目录，收集 rules/ 下所有文本文件。relpath 用 'rules/<文件名>'。若不存在记 null。"},
+            {"kind": "agents_md", "path": "~/.codex/AGENTS.md", "desc": "全局指令 AGENTS.md（若存在）。relpath 用 'AGENTS.md'。"},
+            {"kind": "memory", "path": "~/.codex/memories_1.sqlite", "desc": "【当前不支持】Codex 记忆是 SQLite 二进制数据库（memories_1.sqlite），无法作为文本备份，且跨版本 schema 可能不兼容。请不要读取或备份该数据库，直接把该 key 设为 null。此为已知限制，待后续支持二进制资产同步。"},
+        ],
+    },
     "cursor": {
         "display_name": "Cursor",
         "items": [
