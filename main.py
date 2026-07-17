@@ -112,6 +112,150 @@ def _config_key(user_id: str, client_type: str) -> str:
 def _config_index_key(user_id: str) -> str:
     return f"configs/{user_id}/_index.json"
 
+
+def _mcp_store_key(user_id: str) -> str:
+    """用户托管的 MCP 连接列表（平台填写，可含密钥，同步到本地）。"""
+    return f"mcps/{user_id}/servers.json"
+
+
+def _new_mcp_id() -> str:
+    import uuid
+    return "mcp_" + uuid.uuid4().hex[:12]
+
+
+# 各客户端把「一条 MCP 服务器」写进本地配置时的目标路径提示（给 AI 写回用）
+MCP_INSTALL_TARGETS = {
+    "reasonix": {
+        "path": "~/.reasonix/config.toml",
+        "hint": (
+            "Reasonix：把服务器写入 ~/.reasonix/config.toml 的 [[plugins]] 段。"
+            "type=http 时用 url + headers；type=stdio 时用 command + args + env。"
+            "name 用服务器的 name 字段。密钥已包含在返回内容中，直接写入即可。"
+        ),
+    },
+    "hermes": {
+        "path": "~/.hermes/cli-config.yaml",
+        "hint": "Hermes：按 cli-config.yaml 里 MCP 段的格式写入；密钥已包含，直接写入。",
+    },
+    "codex": {
+        "path": "~/.codex/config.toml",
+        "hint": "Codex：写入 ~/.codex/config.toml 的 MCP 相关段；密钥已包含，直接写入。",
+    },
+    "cursor": {
+        "path": "~/.cursor/mcp.json",
+        "hint": (
+            "Cursor：写入 ~/.cursor/mcp.json 的 mcpServers 对象。"
+            "http 型：{ url, headers }；stdio 型：{ command, args, env }。"
+        ),
+    },
+    "workbuddy": {
+        "path": "~/.workbuddy/mcp.json",
+        "hint": "WorkBuddy：写入 ~/.workbuddy/mcp.json（或 .mcp.json）；密钥已包含，直接写入。",
+    },
+    "windsurf": {
+        "path": "~/.codeium/windsurf/mcp_config.json",
+        "hint": "Windsurf：写入 mcp_config.json 的 MCP 服务器表。",
+    },
+    "unknown": {
+        "path": "",
+        "hint": "按当前客户端惯例把 MCP 服务器写入其配置文件；密钥已包含。",
+    },
+}
+
+
+def _load_mcp_servers(user_id: str) -> list:
+    data = _storage_get(_mcp_store_key(user_id)) or {}
+    servers = data.get("servers")
+    return servers if isinstance(servers, list) else []
+
+
+def _save_mcp_servers(user_id: str, servers: list) -> None:
+    _storage_put(_mcp_store_key(user_id), {
+        "servers": servers,
+        "updated_at": datetime.now().isoformat(),
+    })
+
+
+def _public_mcp_server(s: dict, *, reveal_secrets: bool = False) -> dict:
+    """列表/详情对外字段。默认脱敏 headers/env 里的敏感值；拉取安装时可全量。"""
+    out = {
+        "id": s.get("id"),
+        "name": s.get("name"),
+        "transport": s.get("transport") or "http",
+        "url": s.get("url") or "",
+        "command": s.get("command") or "",
+        "args": s.get("args") if isinstance(s.get("args"), list) else [],
+        "note": s.get("note") or "",
+        "updated_at": s.get("updated_at"),
+    }
+    headers = s.get("headers") if isinstance(s.get("headers"), dict) else {}
+    env = s.get("env") if isinstance(s.get("env"), dict) else {}
+    if reveal_secrets:
+        out["headers"] = headers
+        out["env"] = env
+    else:
+        def _mask(d):
+            masked = {}
+            for k, v in d.items():
+                sv = str(v) if v is not None else ""
+                if not sv:
+                    masked[k] = ""
+                elif len(sv) <= 8:
+                    masked[k] = "********"
+                else:
+                    masked[k] = sv[:2] + "****" + sv[-2:]
+            return masked
+        out["headers"] = _mask(headers)
+        out["env"] = _mask(env)
+        out["has_secrets"] = bool(headers or env)
+    return out
+
+
+def _normalize_mcp_payload(body: dict, *, partial: bool = False) -> dict:
+    """校验并规整创建/更新 body。"""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+    name = (body.get("name") or "").strip()
+    if not partial and not name:
+        raise HTTPException(status_code=400, detail="name 必填（服务器标识，如 zoho-books）")
+    if name and not all(c.isalnum() or c in "-_" for c in name):
+        raise HTTPException(status_code=400, detail="name 仅允许字母数字、-、_")
+
+    transport = (body.get("transport") or "http").strip().lower()
+    if transport not in ("http", "stdio"):
+        raise HTTPException(status_code=400, detail="transport 只能是 http 或 stdio")
+
+    url = (body.get("url") or "").strip()
+    command = (body.get("command") or "").strip()
+    args = body.get("args") if isinstance(body.get("args"), list) else []
+    args = [str(a) for a in args]
+    headers = body.get("headers") if isinstance(body.get("headers"), dict) else {}
+    headers = {str(k): str(v) for k, v in headers.items()}
+    env = body.get("env") if isinstance(body.get("env"), dict) else {}
+    env = {str(k): str(v) for k, v in env.items()}
+    note = (body.get("note") or "").strip()
+
+    if not partial:
+        if transport == "http" and not url:
+            raise HTTPException(status_code=400, detail="http 类型必须提供 url")
+        if transport == "stdio" and not command:
+            raise HTTPException(status_code=400, detail="stdio 类型必须提供 command")
+
+    out = {
+        "transport": transport,
+        "url": url,
+        "command": command,
+        "args": args,
+        "headers": headers,
+        "env": env,
+        "note": note,
+    }
+    if name:
+        out["name"] = name
+    return out
+
+
 # ============= Pydantic 模型 =============
 
 class RegisterRequest(BaseModel):
@@ -418,8 +562,40 @@ MCP_TOOLS = [
     },
     {
         "name": "syncagent_status",
-        "description": "查看云端配置状态",
+        "description": "查看云端养成资产备份状态，以及已托管的 MCP 服务器数量。",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "syncagent_list_mcps",
+        "description": (
+            "列出当前用户在 SyncAgent 平台托管的 MCP 服务器摘要（名称、类型、url/command）。"
+            "密钥默认脱敏。若要安装到本地，请用 syncagent_pull_mcps。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "syncagent_pull_mcps",
+        "description": (
+            "从云端拉取用户托管的 MCP 服务器完整配置（含 headers/env 中的密钥），"
+            "并返回按 client_type 写回本地的安装指令。"
+            "这是「平台填写 → 同步到本地」的路径：密钥不经备份流程，直接由平台下发。"
+            "请把返回的 servers 写入该客户端的 MCP 配置文件；写入前向用户确认是否覆盖同名服务器。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_type": {
+                    "type": "string",
+                    "description": "当前智能体类型，如 reasonix / hermes / codex / workbuddy / cursor",
+                },
+                "names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选。只拉取这些 name；省略则拉取全部。",
+                },
+            },
+            "required": ["client_type"],
+        },
     },
 ]
 
@@ -612,13 +788,65 @@ def _handle_tool_call(user_id, params):
     elif tool_name == "syncagent_status":
         index = _storage_get(_config_index_key(user_id)) or {"clients": {}}
         clients = index.get("clients", {})
-        if not clients:
-            text = "云端暂无配置"
-        else:
-            lines = ["云端配置："]
+        mcps = _load_mcp_servers(user_id)
+        lines = []
+        if clients:
+            lines.append("养成资产备份：")
             for client_type, synced_at in clients.items():
                 lines.append(f"- {client_type}（{synced_at}）")
-            text = "\n".join(lines)
+        else:
+            lines.append("养成资产备份：暂无")
+        if mcps:
+            lines.append(f"托管 MCP：{len(mcps)} 个 → " + ", ".join(
+                (s.get("name") or s.get("id") or "?") for s in mcps
+            ))
+            lines.append("（对 AI 说「把云端 MCP 同步到本地」或调用 syncagent_pull_mcps 写入本机）")
+        else:
+            lines.append("托管 MCP：暂无（请在网页 https://syncagent-web.vercel.app/mcps 添加）")
+        text = "\n".join(lines)
+
+    elif tool_name == "syncagent_list_mcps":
+        servers = _load_mcp_servers(user_id)
+        payload = {
+            "count": len(servers),
+            "servers": [_public_mcp_server(s, reveal_secrets=False) for s in servers],
+            "hint": "完整配置（含密钥）请调用 syncagent_pull_mcps(client_type=...)。",
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+
+    elif tool_name == "syncagent_pull_mcps":
+        client_type = (arguments.get("client_type") or "unknown").strip() or "unknown"
+        names = arguments.get("names")
+        name_filter = None
+        if isinstance(names, list) and names:
+            name_filter = {str(n).strip() for n in names if str(n).strip()}
+
+        servers = _load_mcp_servers(user_id)
+        if name_filter is not None:
+            servers = [s for s in servers if (s.get("name") or "") in name_filter]
+
+        target = MCP_INSTALL_TARGETS.get(client_type, MCP_INSTALL_TARGETS["unknown"])
+        full = [_public_mcp_server(s, reveal_secrets=True) for s in servers]
+        payload = {
+            "client_type": client_type,
+            "target_path": target["path"],
+            "install_hint": target["hint"],
+            "instruction": (
+                "下面 servers 是平台托管的完整 MCP 配置（含密钥）。"
+                f"请写入 {target['path'] or '当前客户端的 MCP 配置文件'}。"
+                "若已存在同名服务器，先向用户确认是否覆盖。"
+                "写完后可提示用户重启客户端使 MCP 生效。"
+                "不要把这些密钥再上传到任何备份工具。"
+            ),
+            "servers": full,
+            "count": len(full),
+        }
+        if not full:
+            payload["instruction"] = (
+                "云端暂无托管 MCP。请用户打开 https://syncagent-web.vercel.app/mcps "
+                "登录后添加服务器（可填 url 与 headers/env 中的密钥），再重新调用本工具。"
+            )
+        text = json.dumps(payload, ensure_ascii=False)
 
     elif tool_name == "syncagent_get_backup_manifest":
         client_type = arguments.get("client_type", "unknown")
@@ -633,7 +861,8 @@ def _handle_tool_call(user_id, params):
                 "目录类条目（skills / memory 等）把目录下每个文件各作为数组里的一个元素，relpath 用相对路径保留原始文件名与子目录结构（如 skills/git-helper/SKILL.md），这样恢复时才能还原到原位。单文件条目也用长度为 1 的数组。"
                 "【必须收齐所有条目，禁止只备份一部分，禁止反过来询问用户是否要备份 skills/memory/soul——它们都是必备项。】"
                 "若某个条目在本机确实不存在（如没有 SOUL.md），把对应 key 显式设为 null，表示“已检查、不存在”，不要省略该 key，否则备份会被判定为未完成并打回。"
-                "【密钥例外】mcp / 配置类文件里的 API key、token 等密钥无需备份：请只保留配置结构，把密钥值替换为占位符或删除；恢复后由用户在新机器本地重新配置。"
+                "【密钥例外】养成资产备份不要收录 MCP/API key。"
+                "若用户要安装平台托管的 MCP，请改用 syncagent_pull_mcps，不要走 backup。"
             ),
         }
         text = json.dumps(payload, ensure_ascii=False)
@@ -781,6 +1010,119 @@ async def delete_backup(client_type: str, authorization: Optional[str] = Header(
         _storage_put(_config_index_key(user_id), index)
 
     return {"deleted": client_type, "remaining": list(clients.keys())}
+
+
+# ============= 托管 MCP API（平台填写 → 同步到本地）=============
+
+
+@app.get("/api/mcps")
+async def list_mcps(authorization: Optional[str] = Header(None)):
+    """列出当前用户托管的 MCP（密钥脱敏）。"""
+    user_id = verify_token(authorization)
+    servers = _load_mcp_servers(user_id)
+    return {
+        "servers": [_public_mcp_server(s, reveal_secrets=False) for s in servers],
+        "count": len(servers),
+    }
+
+
+@app.post("/api/mcps")
+async def create_mcp(request: Request, authorization: Optional[str] = Header(None)):
+    """新增一条托管 MCP（可含 headers/env 密钥）。"""
+    user_id = verify_token(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="无效 JSON")
+    norm = _normalize_mcp_payload(body, partial=False)
+    servers = _load_mcp_servers(user_id)
+    if any((s.get("name") or "") == norm["name"] for s in servers):
+        raise HTTPException(status_code=409, detail=f"已存在同名 MCP：{norm['name']}")
+    now = datetime.now().isoformat()
+    entry = {
+        "id": _new_mcp_id(),
+        "created_at": now,
+        "updated_at": now,
+        **norm,
+    }
+    servers.append(entry)
+    _save_mcp_servers(user_id, servers)
+    return _public_mcp_server(entry, reveal_secrets=False)
+
+
+@app.put("/api/mcps/{mcp_id}")
+async def update_mcp(mcp_id: str, request: Request, authorization: Optional[str] = Header(None)):
+    """更新一条托管 MCP。未传的 headers/env 保持原值；传了空对象则清空。"""
+    user_id = verify_token(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="无效 JSON")
+    servers = _load_mcp_servers(user_id)
+    idx = next((i for i, s in enumerate(servers) if s.get("id") == mcp_id), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="MCP 不存在")
+    existing = servers[idx]
+    # 部分更新：仅覆盖传入字段
+    if "name" in body and body.get("name") is not None:
+        new_name = str(body.get("name") or "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="name 不能为空")
+        if not all(c.isalnum() or c in "-_" for c in new_name):
+            raise HTTPException(status_code=400, detail="name 仅允许字母数字、-、_")
+        if any(i != idx and (s.get("name") or "") == new_name for i, s in enumerate(servers)):
+            raise HTTPException(status_code=409, detail=f"已存在同名 MCP：{new_name}")
+        existing["name"] = new_name
+    if "transport" in body and body.get("transport") is not None:
+        t = str(body.get("transport") or "").strip().lower()
+        if t not in ("http", "stdio"):
+            raise HTTPException(status_code=400, detail="transport 只能是 http 或 stdio")
+        existing["transport"] = t
+    for field in ("url", "command", "note"):
+        if field in body and body.get(field) is not None:
+            existing[field] = str(body.get(field) or "").strip()
+    if "args" in body and body.get("args") is not None:
+        if not isinstance(body["args"], list):
+            raise HTTPException(status_code=400, detail="args 必须是数组")
+        existing["args"] = [str(a) for a in body["args"]]
+    if "headers" in body:
+        if body.get("headers") is None:
+            pass
+        elif not isinstance(body["headers"], dict):
+            raise HTTPException(status_code=400, detail="headers 必须是对象")
+        else:
+            # 空对象 = 清空；非空 = 整表替换。未传该字段则上面分支不进，保留原值。
+            existing["headers"] = {str(k): str(v) for k, v in body["headers"].items()}
+    if "env" in body:
+        if body.get("env") is None:
+            pass
+        elif not isinstance(body["env"], dict):
+            raise HTTPException(status_code=400, detail="env 必须是对象")
+        else:
+            existing["env"] = {str(k): str(v) for k, v in body["env"].items()}
+
+    transport = existing.get("transport") or "http"
+    if transport == "http" and not (existing.get("url") or "").strip():
+        raise HTTPException(status_code=400, detail="http 类型必须提供 url")
+    if transport == "stdio" and not (existing.get("command") or "").strip():
+        raise HTTPException(status_code=400, detail="stdio 类型必须提供 command")
+
+    existing["updated_at"] = datetime.now().isoformat()
+    servers[idx] = existing
+    _save_mcp_servers(user_id, servers)
+    return _public_mcp_server(existing, reveal_secrets=False)
+
+
+@app.delete("/api/mcps/{mcp_id}")
+async def delete_mcp(mcp_id: str, authorization: Optional[str] = Header(None)):
+    """删除一条托管 MCP。"""
+    user_id = verify_token(authorization)
+    servers = _load_mcp_servers(user_id)
+    new_servers = [s for s in servers if s.get("id") != mcp_id]
+    if len(new_servers) == len(servers):
+        raise HTTPException(status_code=404, detail="MCP 不存在")
+    _save_mcp_servers(user_id, new_servers)
+    return {"deleted": mcp_id, "remaining": len(new_servers)}
 
 
 @app.get("/debug/storage")
