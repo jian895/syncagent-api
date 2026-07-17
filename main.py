@@ -1087,6 +1087,8 @@ async def test_mcp(request: Request, authorization: Optional[str] = Header(None)
     req_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        # 部分 Cloudflare Worker 会 ban 默认 Python-urllib UA（Error 1010）
+        "User-Agent": "Mozilla/5.0 (compatible; SyncAgent/1.0; +https://syncagent-web.vercel.app)",
     }
     for k, v in headers.items():
         if k and v is not None:
