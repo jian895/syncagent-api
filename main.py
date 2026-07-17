@@ -289,12 +289,13 @@ def detect_client_from_mcp_init(client_info: Dict[str, Any]) -> str:
 
 # 每个智能体的配置结构不同，备份清单据此区分。
 # AI 调用 get_backup_manifest 拿到清单后，按 items 逐项收集内容再调用 backup。
+# 说明：MCP / provider / 密钥类配置一律不再纳入备份（结构价值低、且含 key），
+# 统一留待后续「MCP 网关」方案处理。SyncAgent 只同步无 key 的养成资产：
+# 技能(skills) / 记忆(memory) / 人格(soul / identity / user) / 规则(rules) / 项目指令(agents_md)。
 BACKUP_MANIFESTS = {
     "reasonix": {
         "display_name": "Reasonix",
         "items": [
-            {"kind": "mcp", "path": "~/.reasonix/config.toml", "desc": "全局 MCP / provider 配置（~/.reasonix/config.toml）。只备份结构；其中 api_key_env 引用的密钥真值在 <Reasonix home>/.env，属于本机密钥，恢复后本地重配，不要写进备份。收 1 个文件，relpath 用 'config.toml'。"},
-            {"kind": "mcp_project", "path": "./reasonix.toml", "desc": "当前工作区的 MCP 插件配置（工作区根目录 reasonix.toml，[[plugins]] 段，若存在）。只备份结构，密钥同样不上传。relpath 用 'reasonix.toml'。"},
             {"kind": "skills", "path": "~/.reasonix/skills/", "desc": "全局技能，收集每个子目录下的 SKILL.md（含 frontmatter）。每个文件 relpath 用相对 ~/.reasonix/ 的路径，如 'skills/<名字>/SKILL.md'。"},
             {"kind": "memory", "path": "~/.reasonix/projects/<当前工作区编码>/memory/", "desc": "记忆文件，按工作区隔离。定位当前工作区对应的 projects/<编码>/memory/ 目录，收集其中所有 *.md。每个文件 relpath 用 'memory/<文件名>.md'。若当前工作区无记忆则记 null。"},
             {"kind": "agents_md", "path": "./AGENTS.md", "desc": "当前工作区根目录的 AGENTS.md 项目记忆（若存在）。relpath 用 'AGENTS.md'。"},
@@ -303,7 +304,6 @@ BACKUP_MANIFESTS = {
     "hermes": {
         "display_name": "Hermes",
         "items": [
-            {"kind": "mcp", "path": "~/.hermes/cli-config.yaml", "desc": "MCP / 客户端配置（$HERMES_HOME 默认 ~/.hermes）。只备份结构；.env 里的 API key / token 属于本机密钥，恢复后请在新机器本地重新配置，不要写进备份。"},
             {"kind": "skills", "path": "~/.hermes/skills/", "desc": "技能（procedural memory），收集每个子目录下的 SKILL.md；含 openclaw-imports/ 下导入的技能"},
             {"kind": "memory", "path": "~/.hermes/", "desc": "记忆文件，收集 MEMORY.md 与 USER.md（若存在）"},
             {"kind": "soul", "path": "~/.hermes/SOUL.md", "desc": "人格设定 SOUL.md（若存在）"},
@@ -313,38 +313,41 @@ BACKUP_MANIFESTS = {
     "codex": {
         "display_name": "Codex",
         "items": [
-            {"kind": "mcp", "path": "~/.codex/config.toml", "desc": "MCP / provider 配置（~/.codex/config.toml）。只备份结构；其中的 API key / token 属于本机密钥，恢复后本地重配，不要写进备份。auth.json、browser/sessions、mcp-oauth-locks 是登录态，绝不备份。relpath 用 'config.toml'。"},
             {"kind": "skills", "path": "~/.codex/skills/", "desc": "用户技能，收集每个子目录下的 SKILL.md（含 frontmatter）。【只收用户技能，排除 skills/.system/ 系统自带技能，也排除 plugins/、.tmp/ 下的技能】。每个文件 relpath 用相对 ~/.codex/ 的路径，如 'skills/<名字>/SKILL.md'。"},
             {"kind": "rules", "path": "~/.codex/rules/", "desc": "规则 / 人格设定目录，收集 rules/ 下所有文本文件。relpath 用 'rules/<文件名>'。若不存在记 null。"},
             {"kind": "agents_md", "path": "~/.codex/AGENTS.md", "desc": "全局指令 AGENTS.md（若存在）。relpath 用 'AGENTS.md'。"},
             {"kind": "memory", "path": "~/.codex/memories_1.sqlite", "desc": "【当前不支持】Codex 记忆是 SQLite 二进制数据库（memories_1.sqlite），无法作为文本备份，且跨版本 schema 可能不兼容。请不要读取或备份该数据库，直接把该 key 设为 null。此为已知限制，待后续支持二进制资产同步。"},
         ],
     },
+    "workbuddy": {
+        "display_name": "WorkBuddy",
+        "items": [
+            {"kind": "skills", "path": "~/.workbuddy/skills/", "desc": "技能，收集 skills/ 下每个 SKILL.md（含 frontmatter）。relpath 用相对 ~/.workbuddy/ 的路径，如 'skills/<名字>/SKILL.md'。"},
+            {"kind": "memory", "path": "~/.workbuddy/memory/", "desc": "记忆文件，收集 memory/ 下所有 *.md，以及根目录 MEMORY.md（若存在）。relpath 用 'memory/<文件名>.md' 或 'MEMORY.md'。若都不存在记 null。"},
+            {"kind": "soul", "path": "~/.workbuddy/SOUL.md", "desc": "人格设定 SOUL.md（若存在）。relpath 用 'SOUL.md'。"},
+            {"kind": "identity", "path": "~/.workbuddy/IDENTITY.md", "desc": "身份设定 IDENTITY.md（若存在）。relpath 用 'IDENTITY.md'。"},
+            {"kind": "user", "path": "~/.workbuddy/USER.md", "desc": "用户偏好 USER.md（若存在）。relpath 用 'USER.md'。注意：BOOTSTRAP.md 是一次性初始化文件，不备份；connectors/、env/、models.json 含密钥/凭证，不备份。"},
+        ],
+    },
     "cursor": {
         "display_name": "Cursor",
         "items": [
-            {"kind": "mcp", "path": "~/.cursor/mcp.json", "desc": "MCP 服务器配置"},
             {"kind": "rules", "path": ".cursorrules", "desc": "项目规则文件 .cursorrules（若存在）"},
             {"kind": "rules_dir", "path": ".cursor/rules/", "desc": "新版规则目录 .cursor/rules/*.mdc（若存在）"},
-        ],
-    },
-    "claude_desktop": {
-        "display_name": "Claude Desktop",
-        "items": [
-            {"kind": "mcp", "path": "claude_desktop_config.json", "desc": "MCP 服务器配置（mcpServers 段）"},
         ],
     },
     "windsurf": {
         "display_name": "Windsurf",
         "items": [
-            {"kind": "mcp", "path": "~/.codeium/windsurf/mcp_config.json", "desc": "MCP 服务器配置"},
             {"kind": "rules", "path": ".windsurfrules", "desc": "项目规则文件 .windsurfrules（若存在）"},
         ],
     },
     "unknown": {
         "display_name": "未知客户端",
         "items": [
-            {"kind": "mcp", "path": "", "desc": "该客户端的 MCP 服务器配置（自行判断路径）"},
+            {"kind": "skills", "path": "", "desc": "该客户端的技能文件（自行判断路径，收集 SKILL.md 之类）。若无则记 null。"},
+            {"kind": "memory", "path": "", "desc": "该客户端的记忆文件（自行判断路径，收集 *.md）。若无则记 null。"},
+            {"kind": "agents_md", "path": "", "desc": "项目/全局指令文件（AGENTS.md 之类，若存在）。若无则记 null。"},
         ],
     },
 }
@@ -449,6 +452,14 @@ def _jsonrpc_error(msg_id, code, message):
 # 这些不是要恢复的文件，backup 时剥离、restore 时跳过。
 RESERVED_CONFIG_KEYS = {"metadata", "checked_paths", "excluded", "secret_policy", "workspace", "_meta", "notes"}
 
+# MCP / 连接配置类 kind：已全局从 manifest 移除，密钥/连接统一留给未来的「网关」处理。
+# 旧备份里可能还存着这些 kind，restore 时一律跳过，不再写回本地，避免旧的含密钥配置回流。
+MCP_LEGACY_KINDS = {"mcp", "mcp_project", "mcp_config", "models", "connectors", "env"}
+
+
+def _is_mcp_legacy_kind(kind: str) -> bool:
+    return kind in MCP_LEGACY_KINDS or kind.startswith("mcp")
+
 
 def _iter_files(kind, value):
     """把一个 kind 的存储值规整成 [{relpath, content}] 列表。
@@ -481,7 +492,6 @@ def _build_restore_plan(client_type: str, config: dict) -> str:
         config = {}
 
     files = []           # [{kind, relpath, content}]
-    skipped_secret = []  # 密钥类 kind，恢复时提示本机重配
     empty_kinds = []     # 本机不存在（备份时记 null）
     for it in manifest["items"]:
         kind = it.get("kind")
@@ -491,15 +501,19 @@ def _build_restore_plan(client_type: str, config: dict) -> str:
         if not kfiles:
             empty_kinds.append(kind)
             continue
-        if kind.startswith("mcp"):
-            skipped_secret.append(kind)
         for f in kfiles:
             files.append({"kind": kind, "relpath": f["relpath"], "content": f["content"]})
 
     # config 里有、但 manifest 未列的 kind 也一并恢复（向后兼容旧备份）。
     # 跳过 AI 有时自作主张塞进来的元数据键（非文件内容，不该被当成待写文件）。
+    # 也跳过旧备份里的 mcp / 连接配置类 kind——已全局移除，不再写回，统一留给网关。
+    skipped_mcp = []
     for kind, value in config.items():
         if kind in RESERVED_CONFIG_KEYS:
+            continue
+        if _is_mcp_legacy_kind(kind):
+            if _iter_files(kind, value):
+                skipped_mcp.append(kind)
             continue
         if any(it.get("kind") == kind for it in manifest["items"]):
             continue
@@ -509,13 +523,14 @@ def _build_restore_plan(client_type: str, config: dict) -> str:
     plan = {
         "client_type": client_type,
         "instruction": (
-            "下面是需要恢复到本地的文件清单。请把每个 file 的 content 原样写入对应 relpath（相对该客户端配置根目录）。"
+            "下面是需要恢复到本地的文件清单（技能 / 记忆 / 人格等养成资产，均为纯文本、不含密钥）。"
+            "请把每个 file 的 content 原样写入对应 relpath（相对该客户端配置根目录）。"
             "写入前若目录不存在请创建。已存在的文件属于覆盖恢复，请先向用户确认再覆盖。"
-            "mcp / 配置类文件中的密钥为占位符，恢复后需在本机填入真实 API key / token。"
+            "MCP / 模型 / 连接器等含密钥的配置不在恢复范围内，请在新机器本地自行配置。"
         ),
         "files": files,
-        "skipped_secret_kinds": skipped_secret,
         "absent_on_backup": empty_kinds,
+        "skipped_mcp_kinds": skipped_mcp,
     }
     return json.dumps(plan, ensure_ascii=False)
 
