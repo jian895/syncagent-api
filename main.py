@@ -809,8 +809,9 @@ def _handle_tool_call(user_id, params):
         servers = _load_mcp_servers(user_id)
         payload = {
             "count": len(servers),
+            "user_id": user_id,
             "servers": [_public_mcp_server(s, reveal_secrets=False) for s in servers],
-            "hint": "完整配置（含密钥）请调用 syncagent_pull_mcps(client_type=...)。",
+            "hint": "完整配置（含密钥）请调用 syncagent_pull_mcps(client_type=...)。若 count=0 但网页有数据，说明智能体里的 Token 与网页登录不是同一账号，请到 setup 页重新复制安装命令。",
         }
         text = json.dumps(payload, ensure_ascii=False)
 
@@ -829,6 +830,7 @@ def _handle_tool_call(user_id, params):
         full = [_public_mcp_server(s, reveal_secrets=True) for s in servers]
         payload = {
             "client_type": client_type,
+            "user_id": user_id,
             "target_path": target["path"],
             "install_hint": target["hint"],
             "instruction": (
@@ -843,8 +845,11 @@ def _handle_tool_call(user_id, params):
         }
         if not full:
             payload["instruction"] = (
-                "云端暂无托管 MCP。请用户打开 https://syncagent-web.vercel.app/mcps "
-                "登录后添加服务器（可填 url 与 headers/env 中的密钥），再重新调用本工具。"
+                "云端暂无托管 MCP（当前 Token 对应用户 "
+                f"{user_id}）。"
+                "若你刚在网页添加过，多半是智能体里的 SyncAgent Token 与网页登录账号不一致。"
+                "请打开 https://syncagent-web.vercel.app/setup 重新登录，复制最新安装命令写回智能体配置后重试；"
+                "并在 https://syncagent-web.vercel.app/mcps 确认该账号下能看到已添加的 MCP。"
             )
         text = json.dumps(payload, ensure_ascii=False)
 
@@ -1015,6 +1020,31 @@ async def delete_backup(client_type: str, authorization: Optional[str] = Header(
 # ============= 托管 MCP API（平台填写 → 同步到本地）=============
 
 
+@app.get("/api/me")
+async def get_me(authorization: Optional[str] = Header(None)):
+    """返回当前 Token 对应用户摘要，便于排查网页与智能体是否同一账号。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未提供认证 Token")
+    token = authorization[len("Bearer "):]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token 已过期")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="无效的 Token")
+    user_id = payload.get("user_id") or ""
+    email = payload.get("email") or ""
+    mcps = _load_mcp_servers(user_id) if user_id else []
+    index = _storage_get(_config_index_key(user_id)) or {"clients": {}} if user_id else {"clients": {}}
+    return {
+        "user_id": user_id,
+        "email": email,
+        "mcp_count": len(mcps),
+        "mcp_names": [s.get("name") for s in mcps if s.get("name")],
+        "backup_clients": list((index.get("clients") or {}).keys()),
+    }
+
+
 @app.get("/api/mcps")
 async def list_mcps(authorization: Optional[str] = Header(None)):
     """列出当前用户托管的 MCP（密钥脱敏）。"""
@@ -1023,6 +1053,7 @@ async def list_mcps(authorization: Optional[str] = Header(None)):
     return {
         "servers": [_public_mcp_server(s, reveal_secrets=False) for s in servers],
         "count": len(servers),
+        "user_id": user_id,
     }
 
 
